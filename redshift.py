@@ -10,6 +10,7 @@ from model import (
     AssignmentStatus,
     ContentItem,
     PathStep,
+    PoolQuestion,
     Proposal,
     Recommendation,
     Status,
@@ -126,6 +127,23 @@ def load_content_items(course_id: int) -> list[ContentItem]:
     return [from_row(ContentItem, row) for row in rows]
 
 
+def load_question_pool(course_id: int) -> list[PoolQuestion]:
+    sql = (
+        f"SELECT {_columns(PoolQuestion)} FROM {SCHEMA}.question_pool WHERE course_id = :course_id"
+        " ORDER BY topic, question_id"
+    )
+    rows = run(sql, [{"name": "course_id", "value": course_id}])
+    return [from_row(PoolQuestion, row) for row in rows]
+
+
+def insert_content_item(item: ContentItem) -> None:
+    # computed_at is left out so the table's GETDATE() default fills it, as it does for a load run
+    names = [f.name for f in fields(ContentItem) if f.name != "computed_at"]
+    values = ", ".join(quote(getattr(item, name)) for name in names)
+    sql = f"INSERT INTO {SCHEMA}.content_items ({', '.join(names)}) VALUES ({values})"
+    _execute(sql)
+
+
 def existing_dedupe_keys(keys: list[str]) -> set[str]:
     if not keys:
         return set()
@@ -214,6 +232,14 @@ def set_status(
         return updated > 0
     check = run(f"SELECT status FROM {SCHEMA}.recommendations WHERE id = {quote(id)}")
     return bool(check) and check[0]["status"] == str(new_status)
+
+
+def set_next_step(id: int, url: str, title: str) -> None:
+    sql = (
+        f"UPDATE {SCHEMA}.recommendations SET next_url = {quote(url)},"
+        f" next_title = {quote(title)} WHERE id = {quote(id)}"
+    )
+    _execute(sql)
 
 
 def _path_row(course_id: int, user_id: int, step: PathStep) -> str:

@@ -65,6 +65,32 @@ the Modules page to catch up within five minutes.
 Windows ships no time zone database, which is why `tzdata` is a dependency. Nothing else in
 the tool reads the clock.
 
+## Practice quizzes and the quiz surface
+
+Rule `R2` fires on exactly the condition `R1` fires on: a student at medium or high risk, or
+averaging under 60 percent on quizzes, whose missing work names the topic of a remediation
+module. Both rules read that condition from one helper in `rules.py`, so they cannot drift
+apart. Where `R1` proposes assigning the module, `R2` proposes building a five-question practice
+quiz on that topic inside it. One proposal per remediation module, on the surface `quiz`. It
+queues, approves and rejects like any other row, and `queue` prints it in the same table.
+
+Pushing a `quiz` row reads `nudges.question_pool`, takes the first five questions for the topic
+in `question_id` order, and calls the MCP tool `create_quiz_from_pool`. Canvas gets a practice
+quiz, so it never affects a grade, published on creation so the student can take it the moment
+the educator approves. The tool is idempotent by title within the course. A second approved row
+for the same topic therefore finds the quiz that already exists, and the push only updates that
+row's next step. When the push did create the quiz it also writes one `nudges.content_items` row
+for it, which puts the quiz in a student's path on the next `path` run without waiting for a
+full reload from Canvas. A later `load_content_items.py` run in the `redshift` repository
+produces the same row.
+
+Question selection is deterministic. Same topic, same five questions, every run, so a retry
+after a crash builds the quiz the educator approved rather than a different one.
+
+The pool is a stand-in for a real question bank. `nudges.question_pool` holds sixteen seeded SAT
+questions across four topics, loaded by `load_question_pool.py` in the sibling `redshift`
+repository. That repository's README describes the table and where a real bank would replace it.
+
 ## Approval page
 
 ```
@@ -130,8 +156,9 @@ with `os error 32` whenever a Claude Code session or the agent has that server r
    uv run pytest -q
    ```
 
-   Expect `20 passed`. The tests read the seed CSVs from the sibling `redshift`
-   repository and the module items from `tests\fixtures\content_items.csv`.
+   Expect `29 passed`. The tests read the seed CSVs from the sibling `redshift`
+   repository, the module items from `tests\fixtures\content_items.csv`, and the question
+   pool from `tests\fixtures\question_pool.csv`.
 
 4. Optional. Reset the queue to start clean.
 
@@ -149,9 +176,10 @@ with `os error 32` whenever a Claude Code session or the agent has that server r
    uv run nudge_agent.py status
    ```
 
-   Expect 18 inserted, then the queue and a status of proposed 18. Three of those are R1 rows
-   on the `module` surface, for users 5, 6 and 10. Scan also rebuilds the paths and prints the
-   total step count. If you skipped step 4, scan inserts 0 and reports 18 duplicates.
+   Expect 21 inserted, then the queue and a status of proposed 21. Six of those come from the
+   remediation rules, for users 5, 6 and 10: three R1 rows on the `module` surface and three R2
+   rows on the `quiz` surface. Scan also rebuilds the paths and prints the total step count. If
+   you skipped step 4, scan inserts 0 and reports 21 duplicates.
 
 6. Prove reruns are safe.
 
@@ -159,7 +187,7 @@ with `os error 32` whenever a Claude Code session or the agent has that server r
    uv run nudge_agent.py scan --as-of 2026-09-15
    ```
 
-   Expect inserted 0, skipped as duplicate 18. The paths are rebuilt either way, because
+   Expect inserted 0, skipped as duplicate 21. The paths are rebuilt either way, because
    `replace_paths` deletes and reinserts the course rather than deduplicating.
 
    Check the paths on their own:

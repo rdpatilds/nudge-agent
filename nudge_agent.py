@@ -9,9 +9,10 @@ from zoneinfo import ZoneInfo
 import canvas_api
 import next_step
 import path
+import quiz_pool
 import redshift
-from canvas_mcp import NudgeSession
-from model import Proposal, Recommendation, Status
+from canvas_mcp import NudgeSession, parse_quiz_result
+from model import ContentItem, Proposal, Recommendation, Status
 from rules import RULES, run_rules
 
 TZ = "America/New_York"
@@ -88,7 +89,59 @@ def push_approved() -> dict[str, int]:
     return asyncio.run(_push(pending))
 
 
-async def _push_row(session: NudgeSession, row: Recommendation) -> str:
+async def _push_quiz(
+    session: NudgeSession, row: Recommendation, items: list[ContentItem]
+) -> str:
+    reason = json.loads(row.reason or "{}")
+    module_id = int(reason["module_id"])
+    questions = quiz_pool.select_questions(
+        redshift.load_question_pool(row.course_id), reason["topic"], int(reason["count"])
+    )
+    title = quiz_pool.quiz_title(reason["topic"])
+    result = parse_quiz_result(
+        await session.create_quiz(
+            row.course_id,
+            title,
+            reason["topic"],
+            quiz_pool.to_tool_questions(questions),
+            module_id,
+            True,
+        )
+    )
+    redshift.set_next_step(row.id, result["url"], title)
+    if not result["created"]:
+        return "quizzes_existing"
+    in_module = [i for i in items if i.module_id == module_id]
+    redshift.insert_content_item(
+        ContentItem(
+            course_id=row.course_id,
+            module_id=module_id,
+            module_position=(
+                in_module[0].module_position
+                if in_module
+                else max((i.module_position for i in items), default=0) + 1
+            ),
+            module_name=reason["module_name"],
+            module_item_id=result["module_item_id"],
+            item_position=max((i.item_position for i in in_module), default=0) + 1,
+            item_type="Quiz",
+            content_id=result["quiz_id"],
+            title=title,
+            url=result["url"],
+            topics=reason["topic"],
+            difficulty="practice",
+            is_practice=True,
+            computed_at=None,
+        )
+    )
+    return "quizzes_created"
+
+
+async def _push_row(
+    session: NudgeSession, row: Recommendation, items: list[ContentItem]
+) -> str:
+    if row.surface == "quiz":
+        return await _push_quiz(session, row, items)
     if row.surface == "module":
         reason = json.loads(row.reason or "{}")
         text = await session.assign_module(row.course_id, int(reason["module_id"]), [row.user_id])
@@ -106,6 +159,8 @@ async def _push(pending: list[Recommendation]) -> dict[str, int]:
         "pushed": 0,
         "already_present": 0,
         "modules_assigned": 0,
+        "quizzes_created": 0,
+        "quizzes_existing": 0,
         "failed": 0,
         "skipped_advisor": 0,
     }
@@ -118,10 +173,15 @@ async def _push(pending: list[Recommendation]) -> dict[str, int]:
     if not rows:
         return tally
 
+    items_by_course = {
+        course_id: redshift.load_content_items(course_id)
+        for course_id in {r.course_id for r in rows if r.surface == "quiz"}
+    }
+
     async with NudgeSession() as session:
         for row in rows:
             try:
-                outcome = await _push_row(session, row)
+                outcome = await _push_row(session, row, items_by_course.get(row.course_id, []))
                 redshift.set_status(row.id, Status.pushed)
                 tally[outcome] += 1
             except Exception as exc:
@@ -201,6 +261,8 @@ def cmd_push(args: argparse.Namespace) -> int:
     print(
         f"pushed {tally['pushed']}, already present {tally['already_present']}, "
         f"modules assigned {tally['modules_assigned']}, "
+        f"quizzes created {tally['quizzes_created']}, "
+        f"quizzes existing {tally['quizzes_existing']}, "
         f"failed {tally['failed']}, skipped advisor {tally['skipped_advisor']}"
     )
     return 0

@@ -1,8 +1,9 @@
+import json
 from dataclasses import dataclass, field, fields
 from datetime import date, datetime
 from enum import StrEnum
 from types import NoneType, UnionType
-from typing import Any, get_args
+from typing import Any, get_args, get_origin
 
 
 class Status(StrEnum):
@@ -87,6 +88,17 @@ class ContentItem:
 
 
 @dataclass(frozen=True)
+class PoolQuestion:
+    question_id: int
+    topic: str
+    difficulty: str
+    question_type: str
+    question_text: str
+    answers: list[dict]
+    points: float
+
+
+@dataclass(frozen=True)
 class PathStep:
     position: int
     module_item_id: int | None
@@ -148,6 +160,8 @@ def _coerce(kind: Any, value: Any) -> Any:
         return value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
     if kind is bool:
         return value if isinstance(value, bool) else str(value).strip().lower() == "true"
+    if get_origin(kind) is list:
+        return json.loads(value) if isinstance(value, str) else list(value)
     return kind(value)
 
 

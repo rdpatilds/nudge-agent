@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from model import AssignmentStatus, ContentItem, StudentStatus, from_row
+from model import AssignmentStatus, ContentItem, PoolQuestion, StudentStatus, from_row
 
 SEED = Path(__file__).resolve().parents[2] / "redshift" / "seed"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -36,3 +36,8 @@ def assignments_by_user() -> dict[int, list[AssignmentStatus]]:
 @pytest.fixture(scope="session")
 def items() -> list[ContentItem]:
     return load(FIXTURES, "content_items.csv", ContentItem)
+
+
+@pytest.fixture(scope="session")
+def pool() -> list[PoolQuestion]:
+    return load(FIXTURES, "question_pool.csv", PoolQuestion)

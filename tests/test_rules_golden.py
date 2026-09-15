@@ -15,9 +15,10 @@ EXPECTED_FIRINGS = {
     "A5": {4, 10},
     "B3": {7},
     "R1": {5, 6, 10},
+    "R2": {5, 6, 10},
 }
 
-LINKLESS_RULES = {"A4", "R1"}
+LINKLESS_RULES = {"A4", "R1", "R2"}
 
 
 @pytest.fixture(scope="module")

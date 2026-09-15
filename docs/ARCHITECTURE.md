@@ -24,7 +24,7 @@ Three properties shaped every decision:
 ```mermaid
 flowchart LR
     subgraph AWS
-        RS[(Redshift Serverless<br/>nudges.student_course_status<br/>nudges.assignment_status<br/>nudges.content_items<br/>nudges.recommendations<br/>nudges.learning_paths)]
+        RS[(Redshift Serverless<br/>nudges.student_course_status<br/>nudges.assignment_status<br/>nudges.content_items<br/>nudges.question_pool<br/>nudges.recommendations<br/>nudges.learning_paths)]
     end
     subgraph Windows host
         Sched[Task Scheduler<br/>CanvasNudgeScan 09:00<br/>CanvasNudgePush 09:30]
@@ -40,13 +40,15 @@ flowchart LR
     Sched -->|scan, push| CLI
     Web -->|same functions| CLI
     CLI <-->|Data API, IAM| RS
-    CLI -->|list_nudges, push_nudge<br/>assign_module_to_students| MCP
+    CLI -->|list_nudges, push_nudge<br/>assign_module_to_students<br/>create_quiz_from_pool| MCP
     CLI -->|GET module overrides, sections| Canvas
-    MCP -->|PUT users/:id/custom_data/nudges| Canvas
+    MCP -->|PUT users/:id/custom_data/nudges<br/>POST quizzes, questions| Canvas
     Canvas -->|Nudges block on dashboard| Student((Student))
 ```
 
-The agent owns `recommendations` and `learning_paths` and reads the other three tables. It
+The agent owns `recommendations` and `learning_paths` and reads the other four tables, with one
+exception. A quiz push appends one `content_items` row for the quiz it just created, so the path
+builder sees the quiz before the next full reload from Canvas. It
 never writes to Canvas directly; the MCP server is the only Canvas client, which keeps the agent
 free of Canvas API details and lets the same server serve interactive sessions. The one Canvas
 call the agent makes for itself is a read of module overrides, because module visibility is an
@@ -60,16 +62,19 @@ nudge-agent/
   rules.py            Rule registry and pure evaluate functions
   next_step.py        next-step resolvers keyed by rule id, topic helpers, the Canvas base URL
   path.py             learning path builder, five ordered slots over the visible items
+  quiz_pool.py        question selection and the quiz title, both deterministic
   redshift.py         Data API adapter: load, insert, list, set_status, replace_paths
   canvas_mcp.py       stdio MCP client session wrapping the three Canvas tools
   canvas_api.py       read-only Canvas HTTP adapter, module overrides and section members
   nudge_agent.py      use cases (scan, build_paths, approve, reject, push) and the CLI
   approve_web.py      HTTP approval page over the same use cases
   register_schedule.ps1
-  tests/conftest.py   seed and fixture loaders shared by both test modules
+  tests/conftest.py   seed and fixture loaders shared by all three test modules
   tests/test_rules_golden.py
   tests/test_path.py
+  tests/test_quiz_pool.py
   tests/fixtures/content_items.csv
+  tests/fixtures/question_pool.csv
 ```
 
 ```mermaid
@@ -79,6 +84,7 @@ flowchart TD
     Agent --> Rules[rules.py]
     Agent --> Next[next_step.py]
     Agent --> Path[path.py]
+    Agent --> Quiz[quiz_pool.py]
     Agent --> RS[redshift.py]
     Agent --> MCP[canvas_mcp.py]
     Agent --> API[canvas_api.py]
@@ -87,6 +93,7 @@ flowchart TD
     Rules --> Model[model.py]
     Next --> Model
     Path --> Model
+    Quiz --> Model
     RS --> Model
     API --> Model
     MCP --> Next
@@ -94,7 +101,9 @@ flowchart TD
     Test[tests] --> Rules
     Test --> Path
     Test --> Next
+    Test --> Quiz
     Test --> Model
+    Test -.->|parse_quiz_result only| MCP
     RS -.->|boto3| DataAPI[(Redshift Data API)]
     MCP -.->|mcp SDK, stdio| Server[canvas-mcp-server.exe]
     API -.->|urllib| REST[(Canvas REST API)]
@@ -123,6 +132,7 @@ it. Neither is imported back, so there is no cycle.
 | `Proposal` | output of a rule, then the resolver | what a rule wants to say and where it points, before it is stored |
 | `Recommendation` | one row of `recommendations` | a stored proposal with next step, status and decision metadata |
 | `ContentItem` | one row of `content_items` | the course's module items, input to the next-step resolver and the path builder |
+| `PoolQuestion` | one row of `question_pool` | one candidate question, read only when a `quiz` row is pushed |
 | `PathStep` | one row of `learning_paths` | one position in a student's ordered to-do list |
 | `Gates` | alias for `dict[int, set[int]]` | module id to the user ids Canvas will show that module to |
 | `Status` | enum | `proposed`, `approved`, `rejected`, `pushed`, `push_failed` |
@@ -142,9 +152,17 @@ ids in its set, and a module mapped to the empty set is visible to nobody. Canva
 semantics fall out of one dict lookup with no branching, and `path.visible_items` is the single
 line that reads it.
 
-All six dataclasses are frozen. `from_row` builds any of them from a Data API row dict,
+`PoolQuestion` carries only what a quiz needs. It drops the table's `course_id`, `source` and
+`computed_at`, because the loader already filters by course and the other two describe where the
+row came from rather than what to ask the student. Its `answers` field is a `list[dict]` of
+`{"text", "correct"}`.
+
+All seven dataclasses are frozen. `from_row` builds any of them from a Data API row dict,
 coercing by the declared field type. This matters because the Data API returns DECIMAL and
-TIMESTAMP columns as strings; the coercion is the one place that handles it.
+TIMESTAMP columns as strings; the coercion is the one place that handles it. A SUPER column
+arrives as a JSON string too, so a field declared `list[...]` is parsed with `json.loads` in that
+same function. That is why `PoolQuestion` needs no loader of its own, and why the CSV fixture and
+the live table produce identical objects from the same code.
 
 ### 4.2 Status state machine
 
@@ -171,7 +189,8 @@ the CLI resolves to one winner.
 
 `Proposal.dedupe_key(as_of)` is `rule|course_id|user_id|subject|date`. `subject` names what
 the rule is about: the assignment ids for A1 and A2, the literal `inactive` for A3 and A4,
-`quiz` for A5, `quiz_avg` for B3, and `module:<module_id>` for R1. Scan looks up the keys it is
+`quiz` for A5, `quiz_avg` for B3, `module:<module_id>` for R1, and
+`quiz:<module_id>:<topic>` for R2. Scan looks up the keys it is
 about to insert and drops any that already exist, so a second scan on the same day inserts nothing and a new day proposes
 again if the fact still holds. Redshift does not enforce uniqueness, so this check is the
 whole guarantee.
@@ -201,25 +220,36 @@ the scan, approve, or push code changes.
 | A5 | at least one quiz in progress | block | 3 |
 | B3 | quiz average below 60 percent, and not NULL | block | 3 |
 | R1 | medium or high risk, or a quiz average under 60 percent, and a remediation module whose topic the student needs | module | 2 |
+| R2 | the same condition as R1 | quiz | 3 |
 
 `tier` records where a rule's inputs come from. An `A` rule is fed by student events and a `B`
-rule is swept from aggregates. R1 is neither, so it carries its own tier `R`. It reads the module
-catalogue, asks which remedial modules exist and which topics they cover, and proposes assigning
-one. Nothing about it is driven by an event or a nightly aggregate, and calling it A or B would
-misdescribe when it needs to run.
+rule is swept from aggregates. R1 and R2 are neither, so they carry their own tier `R`. Both read
+the module catalogue, ask which remedial modules exist and which topics they cover, and propose
+an educator action on one. Nothing about them is driven by an event or a nightly aggregate, and
+calling them A or B would misdescribe when they need to run.
+
+R1 and R2 answer one question with two actions. `_remediation_targets` in `rules.py` owns the
+question: given a student, which remediation modules does that student need, as
+`(module_id, topic, module_name)`. It holds the risk-and-average check, the `topic_need` filter
+and the module-name lookup. R1 adds the `basis` that names the missing item behind the proposal.
+R2 adds nothing at all and reads the triple straight. Writing the condition twice would have let
+the two rules drift, so that the queue could offer a quiz for a module it no longer offers to
+assign.
 
 Every evaluator takes the course's `ContentItem` rows alongside the student and the assignment
-rows. The six original rules ignore the argument. R1 needs it, and giving it to all seven keeps
-one signature in the registry rather than a second kind of rule.
+rows. The six original rules ignore the argument. R1 and R2 need it, and giving it to all eight
+keeps one signature in the registry rather than a second kind of rule.
 
-An evaluator returns a list of proposals rather than one or none, because R1 fires once per
-remediation module and a course may carry several.
+An evaluator returns a list of proposals rather than one or none, because R1 and R2 each fire
+once per remediation module and a course may carry several.
 
 `surface` is what makes A4 different without a special case: the push loop skips any row
 whose surface is `advisor`. The same field is what makes R1 different. A `module` row is pushed
 by assigning a Canvas module override instead of writing a dashboard nudge, and the push step
 reads the surface to choose. Adding the surface changed one dispatch function. The queue, the
-approval page, the dedupe key, and the state machine all carry a `module` row unaltered. Approving an A4 row records the decision for the advisor and
+approval page, the dedupe key, and the state machine all carry a `module` row unaltered. The
+`quiz` surface arrived the same way and cost the same: one more branch in that dispatch function
+and nothing else. Approving an A4 row records the decision for the advisor and
 nothing else happens. In this POC `inbox` rows are pushed to the dashboard because the MCP
 server has no Inbox tool; the field is kept so a future Inbox path can branch on it.
 
@@ -229,20 +259,32 @@ approval or push steps.
 
 ### 5.1 The golden test
 
-`tests/conftest.py` loads the two seed CSVs from the sibling `redshift` repository and the
-fourteen module items of course 1 from `tests/fixtures/content_items.csv`, and hands them to
-both test modules as session fixtures.
+`tests/conftest.py` loads the two seed CSVs from the sibling `redshift` repository, the fourteen
+module items of course 1 from `tests/fixtures/content_items.csv`, and the sixteen pool questions
+from `tests/fixtures/question_pool.csv`, and hands them to the three test modules as session
+fixtures. Both fixture CSVs are byte-for-byte copies of the seed the `redshift` loaders read, so
+a test can only pass on data the live table also holds.
 
 `tests/test_rules_golden.py` runs the registry as of 15 September 2026 and asserts that the set
-of users each rule fires for equals the document's Day 0 table, now with R1 for users 5, 6 and
-10. Two further assertions pin exact message text. The rest pin the resolved link for at least
-one proposal of every linking rule, and that A4 and R1 carry none. A4 has no link because an
-advisor draft is never pushed, R1 because a module assignment is not a link the student clicks.
+of users each rule fires for equals the document's Day 0 table, now with R1 and R2 for users 5,
+6 and 10. Two further assertions pin exact message text. The rest pin the resolved link for at
+least one proposal of every linking rule, and that A4, R1 and R2 carry none. A4 has no link
+because an advisor draft is never pushed. R1 and R2 have none because a module assignment and a
+quiz that does not exist yet are not links the student clicks; the quiz gets its link at push
+time, once Canvas has given it a URL.
 
 `tests/test_path.py` pins the path builder against the same fixtures, with module 4 gated shut
 and then assigned to Elena, so the ordering of the five slots and the effect of a gate are both
-covered. Neither test needs the network, so together they are the fastest check that an edit did
-not change behaviour.
+covered.
+
+`tests/test_quiz_pool.py` pins R2's firing set and its exact text for Elena, the two selection
+cases, the tool payload for one question, and `parse_quiz_result` on a created line, an existing
+line, and a line that is neither. It is the one test module that imports an adapter, for
+`parse_quiz_result` alone. That function is pure and makes no call, which is why it can be tested
+next to the pure modules.
+
+No test needs the network, so together they are the fastest check that an edit did not change
+behaviour.
 
 ### 5.2 Next-step resolver
 
@@ -331,6 +373,35 @@ The path is derived state, recomputed from scratch every run, which is what make
 is the opposite choice from `recommendations`, where a row is an audit record with a human
 decision attached and nothing is ever deleted.
 
+### 5.4 Quiz from pool
+
+`quiz_pool.py` is the third pure module. It answers two questions and nothing else: which
+questions go in the quiz, and what the quiz is called.
+
+`select_questions(pool, topic, count)` filters the pool to one topic, orders by `question_id`,
+and takes the first `count`. No sampling, no shuffling, no balancing across difficulty.
+Determinism is the point. An approved row can be pushed after a `push_failed` retry a day later,
+and it has to build the quiz the educator read about in the proposal rather than a different one
+with the same title. A topic holding fewer questions than asked returns what it has. Reading
+holds four, so a five-question request for it yields four, and that is not an error.
+
+`quiz_title(topic, course_code)` returns `"<topic> practice quiz (SAT-101)"`. That string is the
+whole idempotence story for this surface. `create_quiz_from_pool` matches on title within the
+course, so a second approved row naming the same topic gets the existing quiz back with
+`created=false`, and the push writes no second quiz and no second content item. The agent stores
+no quiz id of its own, the same way it stores nothing about who is assigned to a module. Canvas
+is asked.
+
+`to_tool_questions` rebuilds each answer from its `text` and `correct` keys rather than passing
+the stored SUPER value straight through, so a column added to the pool later cannot leak into a
+Canvas call unnoticed.
+
+The pool itself is a stand-in. `nudges.question_pool` holds sixteen hand-written SAT questions
+across four topics, loaded from a seed CSV by `load_question_pool.py` in the `redshift`
+repository, and its `source` column says so on every row. A real question bank replaces the table
+without touching this module, because the only thing `quiz_pool.py` knows about a question is
+`PoolQuestion`.
+
 ## 6. Use cases
 
 ### 6.1 Scan
@@ -384,9 +455,16 @@ sequenceDiagram
     T->>A: push_approved()
     A->>R: list_recommendations()
     A->>A: keep approved + push_failed, drop surface=advisor
+    A->>R: load_content_items, only for courses with a quiz row
     A->>M: open one stdio session
     loop each row
-        alt surface is module
+        alt surface is quiz
+            A->>R: load_question_pool(course_id)
+            A->>M: create_quiz(course_id, title, topic, questions, module_id, publish=True)
+            M->>C: create_quiz_from_pool
+            A->>R: set_next_step(id, url, title)
+            Note over A,R: created=true also inserts one content_items row
+        else surface is module
             A->>M: assign_module(course_id, module_id, [user_id])
             M->>C: assign_module_to_students
             Note over A,M: Assigned and Already assigned both count as done
@@ -419,9 +497,30 @@ and the row keeps its error for the next run. This gives the module surface the 
 tolerance the `list_nudges` check gives the dashboard surface, and from the same source, the tool
 being safe to call twice.
 
+A `quiz` row takes the branch before it, in `_push_quiz`. It reads the same stored `reason`,
+selects the questions, and calls `create_quiz_from_pool` with `publish=True`. Publishing on
+creation is deliberate. The quiz is a practice quiz at the tool, so it never touches a grade, and
+an unpublished quiz would leave the student nothing to click after the educator approved. The
+tool's first line is the only thing the agent reads back, and `parse_quiz_result` turns it into
+the quiz id, its URL, the module item id, and the two booleans. Every `quiz` row then gets
+`set_next_step`, so the approved row carries the link to the quiz it produced and the queue and
+the approval page show it like any other next step.
+
+`created` decides the rest. When the tool made the quiz, the push inserts one `content_items` row
+for it, positioned last in the remediation module, typed `Quiz`, marked practice. That is what
+puts the quiz in the student's path on the next `path` run instead of waiting for someone to
+rerun `load_content_items.py`. When the tool found the quiz already there, `created` is false, no
+row is inserted, and the push has done nothing but refresh the link. That is the case of a second
+approved row for the same topic, and it is why the insert is gated on the tool's answer rather
+than on the row's own status.
+
+The content items the insert needs for its positions are loaded once per push run, and only for
+courses that actually have a `quiz` row pending, so a push with no quiz rows issues no extra
+query.
+
 `_push_row` returns the name of the tally bucket it filled, so the loop marks the row and counts
-it without knowing which surface it handled. The tally gained `modules_assigned` and nothing else
-in the loop changed.
+it without knowing which surface it handled. The tally gained `modules_assigned`, then
+`quizzes_created` and `quizzes_existing`, and nothing else in the loop changed either time.
 
 One MCP session is opened per push run, not per row, because spawning the server process
 costs a few seconds.
@@ -436,6 +535,17 @@ not accept parameters inside `VALUES` lists for multi-row inserts; every value p
 `quote`, which escapes single quotes and renders `None` as `NULL`. `reason` is written with
 `JSON_PARSE` so it lands as SUPER.
 
+`load_question_pool` reads `question_pool` ordered by topic then `question_id`, so the rows reach
+`select_questions` already in the order it wants. `set_next_step` is one `UPDATE` of `next_url`
+and `next_title`, with no status predicate, because it records what the push produced rather than
+moving the row through the state machine.
+
+`insert_content_item` builds its column list from `ContentItem`'s own fields, the same way
+`replace_paths` builds its list from `PathStep`, so the columns and the values cannot drift apart
+when the dataclass gains a field. It leaves `computed_at` out on purpose. The table declares
+`computed_at TIMESTAMP DEFAULT GETDATE()`, and letting that default fire is what makes the pushed
+row indistinguishable from the one a later `load_content_items.py` run writes for the same quiz.
+
 `replace_paths` is the one write that does not go through `_execute`. It sends a `DELETE` and a
 multi-row `INSERT` as a two-element `Sqls` list to `batch_execute_statement`, so the rebuild is
 one statement to wait on and the table is never observed emptied. When a course has no steps to
@@ -446,13 +556,22 @@ fields, and so are the values, so the two cannot drift apart when the dataclass 
 
 `canvas_mcp.py` launches `canvas-mcp-server.exe` from the cmcp checkout as a stdio subprocess
 with the Canvas URL and token in its environment, then speaks MCP over that pipe using the
-official `mcp` client SDK. `NudgeSession` is an async context manager exposing three calls,
-`list_text`, `push` and `assign_module`. `push` takes the row's `next_url` and passes it as the tool's optional
-`url` argument. When the url is empty the key is left out of the call rather than sent empty,
-because an older server without the parameter would reject an unknown argument. The session
+official `mcp` client SDK. `NudgeSession` is an async context manager exposing four calls,
+`list_text`, `push`, `assign_module` and `create_quiz`. `push` takes the row's `next_url` and
+passes it as the tool's optional `url` argument. When the url is empty the key is left out of the
+call rather than sent empty, because an older server without the parameter would reject an
+unknown argument. `create_quiz` omits `module_id` the same way when there is none. The session
 raises on an MCP error result so the push loop can mark the row failed. The MCP server is the
 same one interactive Claude Code sessions use, so any fix to Canvas handling there applies to
 the agent for free.
+
+`parse_quiz_result` sits in this module as a plain function rather than a method. The tools
+answer in prose for a human reader, and `create_quiz_from_pool` puts its machine-readable facts
+on the first line as `quiz_id=... url=... questions=... published=... module_item_id=...
+created=...`. The parser takes that line, rejects anything that does not start with `quiz_id=`
+with the offending text in the error, and returns a dict. Keeping it here puts the one place that
+knows the tool's wire format next to the one place that calls the tool, and keeping it a function
+is what lets the tests cover it without launching the server.
 
 ### 7.3 Canvas read API
 
@@ -491,7 +610,7 @@ the path reads Canvas back. No state about who is assigned lives in the agent.
 | `queue` | table of proposed rows, with the linked title in a `next` column |
 | `approve ID... \| --all` | mark proposed rows approved |
 | `reject ID --note TEXT` | mark one proposed row rejected |
-| `push` | push approved and retry failed rows, assigning modules for `module` rows |
+| `push` | push approved and retry failed rows, assigning modules for `module` rows and creating quizzes for `quiz` rows |
 | `status` | count of rows per status |
 
 ### 8.2 Web approval page
@@ -521,11 +640,19 @@ Run on 15 September 2026 against the live Redshift workgroup and Canvas instance
 Rows marked offline are computed from the seed CSVs and the item fixture with no network. The
 rest ran against the workgroup and the Canvas container.
 
+The quiz surface was added on 16 September 2026 and its rows below are all offline. R2 has not
+been scanned into the live queue, and no quiz has been created in Canvas yet. Running steps 5, 8
+and 9 of the README walkthrough is what closes that gap; expect 21 proposals where the 15
+September run gave 15.
+
 | Check | Result |
 |---|---|
-| `uv run pytest -q` | 20 passed |
+| `uv run pytest -q` | 29 passed |
 | Elena's path at 2026-09-15, offline | module 4 gated shut, eight steps: Reading Diagnostic, Grammar Rules Drill 1 and Linear Equations Set as `missing`, Word Problems Set `due tomorrow`, Practice Test 1 Reflection `due in 2 days`, then Reading Practice Set, Grammar Practice Set and item 11 Algebra Refresher as practice. With module 4 assigned to her, positions 6 and 7 become items 13 and 14 and position 8 is Reading Practice Set; item 11 drops out because the gated-in copy already took the title |
 | R1 firings at 2026-09-15, offline | users 5, 6 and 10, each with basis `missing:Linear Equations Set`. Ben has the same missing item but is low risk on a 67 percent average, and Farah has a 50 percent average but no assignment rows to name a topic |
+| R2 firings at 2026-09-15, offline | users 5, 6 and 10, matching R1 because both read `_remediation_targets`. Elena's row reads `Create a 5-question Heart of Algebra practice quiz for Elena Rossi in Remediation: Heart of Algebra`, subject `quiz:4:Heart of Algebra` |
+| question selection, offline | Heart of Algebra at count 5 gives question ids 1 to 5 in order. Reading at count 5 gives 10, 11, 12 and 13, because the topic holds four |
+| `_push_quiz` against a stubbed session and a stubbed `_execute`, offline | `created=true` returns `quizzes_created`, writes the `next_url` and `next_title` UPDATE, and writes one `content_items` INSERT with `module_position 4`, `item_position 3` and no `computed_at` column. `created=false` returns `quizzes_existing` and writes the UPDATE alone. A module id absent from `content_items` writes `module_position 5`, one past the last module, and `item_position 1` |
 | resolved links pinned by the golden test (seed ids) | A1 user 4 Word Problems Set, A2 user 5 Grammar Rules Drill 1, A2 user 3 Linear Equations Set, A3 user 5 Grammar Rules Drill 1, A5 user 4 Reading Checkpoint Quiz, B3 user 7 Reading Practice Set with basis `first_practice`; A4 user 6 has no link |
 | `scan --as-of 2026-09-15` | A1 [4,5,6,9,11,12], A2 [3,5,6,11], A3 [5], A4 [6], A5 [4,11], B3 [8]; 15 inserted. Equals the document's Day 0 sets after the id map |
 | second identical scan | 0 inserted, 15 skipped as duplicate |
@@ -542,6 +669,16 @@ rest ran against the workgroup and the Canvas container.
   the streaming feed lands.
 - **Inbox cap.** The document's limit of one Inbox message per student per three days is not
   implemented, because no Inbox send exists in this POC.
+- **The question pool is hand-written.** Sixteen questions across four topics, every row marked
+  `qbank-stand-in` in its `source` column. Heart of Algebra is the only topic with five, so every
+  other topic yields a short quiz at the current count of 5. Point the table at a real bank before
+  this is useful, and `quiz_pool.py` does not change when you do.
+- **A crash between the quiz and its content item loses the row.** The push creates the quiz,
+  records the next step, then inserts the `content_items` row. If it dies between the Canvas call
+  and that insert, the retry gets `created=false` from the tool and skips the insert, so the quiz
+  exists in Canvas and in the queue but not in anyone's path. Closing that properly means asking
+  whether the row is already there, which is one more query on every quiz push. The recovery today
+  is a `load_content_items.py` run, which reads the quiz from Canvas and writes the same row.
 - **Canvas reads are unpaginated.** `canvas_api` requests the overrides and sections endpoints
   once each and reads the first page. A course with more than a hundred sections would be
   truncated. Add `per_page` and `Link` traversal before a real roster.

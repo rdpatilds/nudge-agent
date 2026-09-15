@@ -26,6 +26,22 @@ def _result_text(result: types.CallToolResult) -> str:
     )
 
 
+def parse_quiz_result(text: str) -> dict:
+    line = next(iter(text.splitlines()), "").strip()
+    if not line.startswith("quiz_id="):
+        raise RuntimeError(f"create_quiz_from_pool returned {text!r}")
+    values = dict(token.split("=", 1) for token in line.split())
+    module_item_id = values["module_item_id"]
+    return {
+        "quiz_id": int(values["quiz_id"]),
+        "url": values["url"],
+        "questions": int(values["questions"]),
+        "published": values["published"] == "true",
+        "module_item_id": None if module_item_id == "none" else int(module_item_id),
+        "created": values["created"] == "true",
+    }
+
+
 class NudgeSession:
     async def __aenter__(self) -> "NudgeSession":
         self._stack = AsyncExitStack()
@@ -55,6 +71,24 @@ class NudgeSession:
             "assign_module_to_students",
             {"course_id": course_id, "module_id": module_id, "user_ids": list(user_ids)},
         )
+        text_out = _result_text(result)
+        if result.is_error:
+            raise RuntimeError(text_out)
+        return text_out
+
+    async def create_quiz(
+        self, course_id, title, topic, questions, module_id=None, publish=False
+    ) -> str:
+        arguments = {
+            "course_id": course_id,
+            "title": title,
+            "topic": topic,
+            "questions": questions,
+            "publish": publish,
+        }
+        if module_id is not None:
+            arguments["module_id"] = module_id
+        result = await self._session.call_tool("create_quiz_from_pool", arguments)
         text_out = _result_text(result)
         if result.is_error:
             raise RuntimeError(text_out)

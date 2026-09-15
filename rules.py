@@ -33,6 +33,8 @@ COUNT_WORDS = {
 
 LOW_QUIZ_PERCENT = 60
 
+QUIZ_QUESTIONS = 5
+
 REMEDIATION_RISK = {"medium", "high"}
 
 
@@ -260,13 +262,9 @@ def _b3_targeted_practice(
     ]
 
 
-def _r1_remediation_module(
-    rule: Rule,
-    student: StudentStatus,
-    assignments: list[AssignmentStatus],
-    items: list[ContentItem],
-    as_of: date,
-) -> list[Proposal]:
+def _remediation_targets(
+    student: StudentStatus, assignments: list[AssignmentStatus], items: list[ContentItem]
+) -> list[tuple[int, str, str]]:
     avg = student.quiz_avg_percent
     struggling = student.risk_level in REMEDIATION_RISK or (
         avg is not None and avg < LOW_QUIZ_PERCENT
@@ -274,15 +272,26 @@ def _r1_remediation_module(
     if not struggling:
         return []
     needed = topic_need(assignments, items)
+    names = {i.module_id: i.module_name for i in items}
+    return [
+        (module_id, topic, names.get(module_id, f"{REMEDIATION_PREFIX}{topic}"))
+        for module_id, topic in remediation_modules(items).items()
+        if topic in needed
+    ]
+
+
+def _r1_remediation_module(
+    rule: Rule,
+    student: StudentStatus,
+    assignments: list[AssignmentStatus],
+    items: list[ContentItem],
+    as_of: date,
+) -> list[Proposal]:
     topics_by_assignment = {
         i.content_id: i.topic_list for i in items if i.item_type == "Assignment"
     }
-    names = {i.module_id: i.module_name for i in items}
     proposals = []
-    for module_id, topic in remediation_modules(items).items():
-        if topic not in needed:
-            continue
-        module_name = names.get(module_id, f"{REMEDIATION_PREFIX}{topic}")
+    for module_id, topic, module_name in _remediation_targets(student, assignments, items):
         basis = next(
             (
                 f"missing:{a.title}"
@@ -309,6 +318,33 @@ def _r1_remediation_module(
     return proposals
 
 
+def _r2_practice_quiz(
+    rule: Rule,
+    student: StudentStatus,
+    assignments: list[AssignmentStatus],
+    items: list[ContentItem],
+    as_of: date,
+) -> list[Proposal]:
+    return [
+        _propose(
+            rule,
+            student,
+            subject=f"quiz:{module_id}:{topic}",
+            text=(
+                f"Create a {QUIZ_QUESTIONS}-question {topic} practice quiz "
+                f"for {student.name} in {module_name}"
+            ),
+            reason={
+                "topic": topic,
+                "count": QUIZ_QUESTIONS,
+                "module_id": module_id,
+                "module_name": module_name,
+            },
+        )
+        for module_id, topic, module_name in _remediation_targets(student, assignments, items)
+    ]
+
+
 RULES: list[Rule] = [
     Rule("A1", "A", "block", 4, _a1_due_in_three_days),
     Rule("A2", "A", "block", 2, _a2_missing_work),
@@ -317,6 +353,7 @@ RULES: list[Rule] = [
     Rule("A5", "A", "block", 3, _a5_quiz_in_progress),
     Rule("B3", "B", "block", 3, _b3_targeted_practice),
     Rule("R1", "R", "module", 2, _r1_remediation_module),
+    Rule("R2", "R", "quiz", 3, _r2_practice_quiz),
 ]
 
 
