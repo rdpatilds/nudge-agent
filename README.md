@@ -2,12 +2,14 @@
 
 Reads student status from Redshift, proposes nudges with the rules in `rules.py`, attaches a next
 step to each with the resolvers in `next_step.py`, waits for a human decision, and pushes the
-approved ones into Canvas through the Canvas MCP server.
+approved ones into Canvas through the Canvas MCP server. It also builds each student an ordered
+learning path, the short to-do list the dashboard shows under the nudges.
 
 ## Commands
 
 ```
 uv run nudge_agent.py scan [--course 1] [--as-of YYYY-MM-DD]
+uv run nudge_agent.py path [--course 1] [--as-of YYYY-MM-DD]
 uv run nudge_agent.py queue
 uv run nudge_agent.py approve 12 13
 uv run nudge_agent.py approve --all
@@ -16,10 +18,49 @@ uv run nudge_agent.py push
 uv run nudge_agent.py status
 ```
 
-`scan` runs the rules, resolves the next step for each proposal, and inserts the new
-proposals. `queue` lists what is waiting for a decision. Its `next` column is the title of the
-linked item. `push` sends every approved row to Canvas, text and link together. `as_of`
-defaults to today in America/New_York.
+`scan` runs the rules, resolves the next step for each proposal, inserts the new proposals, and
+then rebuilds every learning path. `path` rebuilds the paths on their own and prints a row per
+student. `queue` lists what is waiting for a decision. Its `next` column is the title of the
+linked item. `push` sends every approved row to Canvas. `as_of` defaults to today in
+America/New_York.
+
+## Learning paths
+
+A path is up to eight module items in the order the student should work them, written to
+`nudges.learning_paths`. Each rebuild replaces the whole course in one statement, so the table
+always reflects the last run and never needs a cleanup pass. Five slots fill the path in order:
+missing assignments oldest first, then work due soon, then an unfinished quiz, then practice
+items matching a topic the student is behind on, then the rest of the course in module order.
+Each step records the reason the student is being sent there and the rule the slot came from.
+A student who has finished every module requirement gets an empty path.
+
+The cap of eight is deliberate. The path is a to-do list on a dashboard, not a syllabus.
+
+## Remediation modules and the module surface
+
+A module named `Remediation: <topic>` is the remedial module for that topic. Rule `R1` proposes
+assigning one to a student who is at medium or high risk, or averaging under 60 percent on
+quizzes, and whose missing work names that topic. Those proposals carry the surface `module`
+rather than `block`, and they queue and approve like any other row.
+
+Pushing a `module` row does not write a dashboard nudge. It calls the MCP tool
+`assign_module_to_students`, which adds the student to the module's Canvas override. The tool is
+additive and idempotent, so a row whose student is already covered comes back as
+`Already assigned` and is marked pushed without a second write.
+
+Canvas module overrides are also what the path builder reads for visibility. A module carrying
+any override is visible only to the students its overrides cover, so `canvas_api.module_gates`
+fetches the overrides for every module in the course and the builder drops the items a student
+cannot see. A module with no overrides is open to everyone. This is why the remediation module
+appears in a student's path only after an educator has approved and pushed the `R1` row for
+them. `CANVAS_TOKEN` overrides the default dev token.
+
+Canvas caches each student's module visibility for five minutes
+(`VisibilityHelpers::CacheSettings.ttl`), and writing an override does not clear that cache.
+If the student's Modules page was loaded shortly before the push, the remediation module stays
+hidden until the cache expires. The override itself is in place immediately; confirm it with
+`list_module_overrides` or `GET /api/v1/courses/1/modules/4/assignment_overrides`, and expect
+the Modules page to catch up within five minutes.
 
 Windows ships no time zone database, which is why `tzdata` is a dependency. Nothing else in
 the tool reads the clock.
@@ -89,7 +130,7 @@ with `os error 32` whenever a Claude Code session or the agent has that server r
    uv run pytest -q
    ```
 
-   Expect `12 passed`. The test reads the seed CSVs from the sibling `redshift`
+   Expect `20 passed`. The tests read the seed CSVs from the sibling `redshift`
    repository and the module items from `tests\fixtures\content_items.csv`.
 
 4. Optional. Reset the queue to start clean.
@@ -108,8 +149,9 @@ with `os error 32` whenever a Claude Code session or the agent has that server r
    uv run nudge_agent.py status
    ```
 
-   Expect 15 inserted, then the queue and a status of proposed 15. If you skipped step 4,
-   scan inserts 0 and reports 15 duplicates.
+   Expect 18 inserted, then the queue and a status of proposed 18. Three of those are R1 rows
+   on the `module` surface, for users 5, 6 and 10. Scan also rebuilds the paths and prints the
+   total step count. If you skipped step 4, scan inserts 0 and reports 18 duplicates.
 
 6. Prove reruns are safe.
 
@@ -117,7 +159,18 @@ with `os error 32` whenever a Claude Code session or the agent has that server r
    uv run nudge_agent.py scan --as-of 2026-09-15
    ```
 
-   Expect inserted 0, skipped as duplicate 15.
+   Expect inserted 0, skipped as duplicate 18. The paths are rebuilt either way, because
+   `replace_paths` deletes and reinserts the course rather than deduplicating.
+
+   Check the paths on their own:
+
+   ```
+   uv run nudge_agent.py path --as-of 2026-09-15
+   ```
+
+   Expect a row per student and Ava at 0 steps, because she has finished every module
+   requirement. Elena's eighth step is the module 2 Algebra Refresher until an R1 row is pushed
+   for her.
 
 7. Check Elena's dashboard before pushing.
 

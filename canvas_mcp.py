@@ -50,6 +50,16 @@ class NudgeSession:
         result = await self._session.call_tool("list_nudges", {"user_id": str(user_id)})
         return _result_text(result)
 
+    async def assign_module(self, course_id, module_id, user_ids) -> str:
+        result = await self._session.call_tool(
+            "assign_module_to_students",
+            {"course_id": course_id, "module_id": module_id, "user_ids": list(user_ids)},
+        )
+        text_out = _result_text(result)
+        if result.is_error:
+            raise RuntimeError(text_out)
+        return text_out
+
     async def push(self, user_id, text, context, url="") -> str:
         arguments = {"user_id": str(user_id), "text": text, "context": context}
         if url:

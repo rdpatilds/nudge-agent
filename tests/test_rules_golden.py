@@ -1,16 +1,9 @@
-import csv
-from datetime import date
-from pathlib import Path
-
 import pytest
 
 import next_step
-from model import AssignmentStatus, ContentItem, Proposal, StudentStatus, from_row
+from model import Proposal
 from rules import RULES, run_rules
 
-SEED = Path(__file__).resolve().parents[2] / "redshift" / "seed"
-FIXTURES = Path(__file__).resolve().parent / "fixtures"
-AS_OF = date(2026, 9, 15)
 COURSE = 1
 ITEMS = "http://localhost:3100/courses/1/modules/items"
 
@@ -21,37 +14,20 @@ EXPECTED_FIRINGS = {
     "A4": {6},
     "A5": {4, 10},
     "B3": {7},
+    "R1": {5, 6, 10},
 }
 
-
-def _load[T](base: Path, name: str, cls: type[T]) -> list[T]:
-    with (base / name).open(newline="", encoding="utf-8") as handle:
-        return [from_row(cls, row) for row in csv.DictReader(handle)]
-
-
-Seed = tuple[list[StudentStatus], dict[int, list[AssignmentStatus]]]
+LINKLESS_RULES = {"A4", "R1"}
 
 
 @pytest.fixture(scope="module")
-def seed() -> Seed:
-    students = _load(SEED, "student_course_status.csv", StudentStatus)
-    assignments_by_user: dict[int, list[AssignmentStatus]] = {}
-    for row in _load(SEED, "assignment_status.csv", AssignmentStatus):
-        assignments_by_user.setdefault(row.user_id, []).append(row)
-    return students, assignments_by_user
+def proposals(students, assignments_by_user, items, as_of) -> list[Proposal]:
+    return run_rules(students, assignments_by_user, items, as_of)
 
 
 @pytest.fixture(scope="module")
-def proposals(seed: Seed) -> list[Proposal]:
-    students, assignments_by_user = seed
-    return run_rules(students, assignments_by_user, AS_OF)
-
-
-@pytest.fixture(scope="module")
-def resolved(seed: Seed, proposals: list[Proposal]) -> list[Proposal]:
-    students, assignments_by_user = seed
+def resolved(students, assignments_by_user, items, proposals) -> list[Proposal]:
     by_user = {s.user_id: s for s in students}
-    items = _load(FIXTURES, "content_items.csv", ContentItem)
     return [
         next_step.resolve(
             p, by_user[p.user_id], assignments_by_user.get(p.user_id, []), items, COURSE
@@ -110,9 +86,15 @@ def test_a4_is_never_linked(resolved: list[Proposal]) -> None:
     assert _one(resolved, "A4", 6).next_url is None
 
 
+def test_r1_carries_no_link(resolved: list[Proposal]) -> None:
+    assert _one(resolved, "R1", 6).next_url is None
+
+
 def test_b3_falls_back_to_the_first_practice_item(resolved: list[Proposal]) -> None:
     assert _one(resolved, "B3", 7).reason["next_step_basis"] == "first_practice"
 
 
-def test_every_pushable_proposal_has_a_link(resolved: list[Proposal]) -> None:
-    assert [p.rule for p in resolved if p.rule != "A4" and p.next_url is None] == []
+def test_every_linking_proposal_has_a_link(resolved: list[Proposal]) -> None:
+    assert [
+        p.rule for p in resolved if p.rule not in LINKLESS_RULES and p.next_url is None
+    ] == []

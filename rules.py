@@ -3,9 +3,12 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from model import AssignmentStatus, Proposal, StudentStatus
+from model import AssignmentStatus, ContentItem, Proposal, StudentStatus
+from next_step import REMEDIATION_PREFIX, remediation_modules, topic_need
 
-Evaluate = Callable[["Rule", StudentStatus, list[AssignmentStatus], date], Proposal | None]
+Evaluate = Callable[
+    ["Rule", StudentStatus, list[AssignmentStatus], list[ContentItem], date], list[Proposal]
+]
 
 
 @dataclass(frozen=True)
@@ -27,6 +30,10 @@ COUNT_WORDS = {
     9: "Nine",
     10: "Ten",
 }
+
+LOW_QUIZ_PERCENT = 60
+
+REMEDIATION_RISK = {"medium", "high"}
 
 
 def _propose(
@@ -67,11 +74,15 @@ def _long_date(day: date) -> str:
 
 
 def _a1_due_in_three_days(
-    rule: Rule, student: StudentStatus, assignments: list[AssignmentStatus], as_of: date
-) -> Proposal | None:
+    rule: Rule,
+    student: StudentStatus,
+    assignments: list[AssignmentStatus],
+    items: list[ContentItem],
+    as_of: date,
+) -> list[Proposal]:
     rows = _with_status(assignments, "due_soon")
     if not rows:
-        return None
+        return []
     first = rows[0]
     if len(rows) == 1:
         text = (
@@ -85,24 +96,30 @@ def _a1_due_in_three_days(
             f"{first.points_possible:g} points. "
             f"{second.title} follows on {_when(second.due_at, as_of)}."
         )
-    return _propose(
-        rule,
-        student,
-        subject="+".join(str(a.assignment_id) for a in rows),
-        text=text,
-        reason={
-            "assignment_ids": [a.assignment_id for a in rows],
-            "titles": [a.title for a in rows],
-        },
-    )
+    return [
+        _propose(
+            rule,
+            student,
+            subject="+".join(str(a.assignment_id) for a in rows),
+            text=text,
+            reason={
+                "assignment_ids": [a.assignment_id for a in rows],
+                "titles": [a.title for a in rows],
+            },
+        )
+    ]
 
 
 def _a2_missing_work(
-    rule: Rule, student: StudentStatus, assignments: list[AssignmentStatus], as_of: date
-) -> Proposal | None:
+    rule: Rule,
+    student: StudentStatus,
+    assignments: list[AssignmentStatus],
+    items: list[ContentItem],
+    as_of: date,
+) -> list[Proposal]:
     rows = _with_status(assignments, "missing")
     if not rows:
-        return None
+        return []
     titles = [a.title for a in rows]
     count = len(rows)
     if count == 1:
@@ -120,20 +137,26 @@ def _a2_missing_work(
             f"{COUNT_WORDS.get(count, str(count))} items are past due, starting with {titles[0]}. "
             "Any one of them moves your score off zero."
         )
-    return _propose(
-        rule,
-        student,
-        subject="+".join(str(a.assignment_id) for a in rows),
-        text=text,
-        reason={"assignment_ids": [a.assignment_id for a in rows], "titles": titles},
-    )
+    return [
+        _propose(
+            rule,
+            student,
+            subject="+".join(str(a.assignment_id) for a in rows),
+            text=text,
+            reason={"assignment_ids": [a.assignment_id for a in rows], "titles": titles},
+        )
+    ]
 
 
 def _a3_seven_days_quiet(
-    rule: Rule, student: StudentStatus, assignments: list[AssignmentStatus], as_of: date
-) -> Proposal | None:
+    rule: Rule,
+    student: StudentStatus,
+    assignments: list[AssignmentStatus],
+    items: list[ContentItem],
+    as_of: date,
+) -> list[Proposal]:
     if not 7 <= student.days_inactive <= 13:
-        return None
+        return []
     last_active = as_of - timedelta(days=student.days_inactive)
     missing = student.assignments_missing
     upcoming = _with_status(assignments, "due_soon")
@@ -142,24 +165,30 @@ def _a3_seven_days_quiet(
         text += f" {missing} {'item is' if missing == 1 else 'items are'} past due."
     if upcoming:
         text += f" {upcoming[0].title} is due {_when(upcoming[0].due_at, as_of)}."
-    return _propose(
-        rule,
-        student,
-        subject="inactive",
-        text=text,
-        reason={
-            "days_inactive": student.days_inactive,
-            "assignments_missing": missing,
-            "next_due_title": upcoming[0].title if upcoming else None,
-        },
-    )
+    return [
+        _propose(
+            rule,
+            student,
+            subject="inactive",
+            text=text,
+            reason={
+                "days_inactive": student.days_inactive,
+                "assignments_missing": missing,
+                "next_due_title": upcoming[0].title if upcoming else None,
+            },
+        )
+    ]
 
 
 def _a4_fourteen_days_quiet(
-    rule: Rule, student: StudentStatus, assignments: list[AssignmentStatus], as_of: date
-) -> Proposal | None:
+    rule: Rule,
+    student: StudentStatus,
+    assignments: list[AssignmentStatus],
+    items: list[ContentItem],
+    as_of: date,
+) -> list[Proposal]:
     if student.days_inactive < 14:
-        return None
+        return []
     last_active = as_of - timedelta(days=student.days_inactive)
     text = (
         f"Advisor draft for {student.name}: no activity since {_long_date(last_active)}, "
@@ -167,54 +196,117 @@ def _a4_fourteen_days_quiet(
         f"{student.module_requirement_completed} of {student.module_requirement_count}, "
         f"risk {student.risk_level}. Review before any outreach."
     )
-    return _propose(
-        rule,
-        student,
-        subject="inactive",
-        text=text,
-        reason={
-            "days_inactive": student.days_inactive,
-            "assignments_missing": student.assignments_missing,
-            "module_requirement_completed": student.module_requirement_completed,
-            "module_requirement_count": student.module_requirement_count,
-            "risk_level": student.risk_level,
-        },
-    )
+    return [
+        _propose(
+            rule,
+            student,
+            subject="inactive",
+            text=text,
+            reason={
+                "days_inactive": student.days_inactive,
+                "assignments_missing": student.assignments_missing,
+                "module_requirement_completed": student.module_requirement_completed,
+                "module_requirement_count": student.module_requirement_count,
+                "risk_level": student.risk_level,
+            },
+        )
+    ]
 
 
 def _a5_quiz_in_progress(
-    rule: Rule, student: StudentStatus, assignments: list[AssignmentStatus], as_of: date
-) -> Proposal | None:
+    rule: Rule,
+    student: StudentStatus,
+    assignments: list[AssignmentStatus],
+    items: list[ContentItem],
+    as_of: date,
+) -> list[Proposal]:
     if student.quizzes_in_progress <= 0:
-        return None
-    return _propose(
-        rule,
-        student,
-        subject="quiz",
-        text=(
-            "A quiz you started is still open. Finish it and the attempt is scored; "
-            "it unlocks the next module item."
-        ),
-        reason={"quizzes_in_progress": student.quizzes_in_progress},
-    )
+        return []
+    return [
+        _propose(
+            rule,
+            student,
+            subject="quiz",
+            text=(
+                "A quiz you started is still open. Finish it and the attempt is scored; "
+                "it unlocks the next module item."
+            ),
+            reason={"quizzes_in_progress": student.quizzes_in_progress},
+        )
+    ]
 
 
 def _b3_targeted_practice(
-    rule: Rule, student: StudentStatus, assignments: list[AssignmentStatus], as_of: date
-) -> Proposal | None:
+    rule: Rule,
+    student: StudentStatus,
+    assignments: list[AssignmentStatus],
+    items: list[ContentItem],
+    as_of: date,
+) -> list[Proposal]:
     avg = student.quiz_avg_percent
-    if avg is None or avg >= 60:
-        return None
-    return _propose(
-        rule,
-        student,
-        subject="quiz_avg",
-        text=(
-            f"Your quiz average is {avg:g} percent. A short refresher quiz has been added "
-            "for you, about 10 minutes, and it does not count toward your grade."
-        ),
-        reason={"quiz_avg_percent": avg},
+    if avg is None or avg >= LOW_QUIZ_PERCENT:
+        return []
+    return [
+        _propose(
+            rule,
+            student,
+            subject="quiz_avg",
+            text=(
+                f"Your quiz average is {avg:g} percent. A short refresher quiz has been added "
+                "for you, about 10 minutes, and it does not count toward your grade."
+            ),
+            reason={"quiz_avg_percent": avg},
+        )
+    ]
+
+
+def _r1_remediation_module(
+    rule: Rule,
+    student: StudentStatus,
+    assignments: list[AssignmentStatus],
+    items: list[ContentItem],
+    as_of: date,
+) -> list[Proposal]:
+    avg = student.quiz_avg_percent
+    struggling = student.risk_level in REMEDIATION_RISK or (
+        avg is not None and avg < LOW_QUIZ_PERCENT
     )
+    if not struggling:
+        return []
+    needed = topic_need(assignments, items)
+    topics_by_assignment = {
+        i.content_id: i.topic_list for i in items if i.item_type == "Assignment"
+    }
+    names = {i.module_id: i.module_name for i in items}
+    proposals = []
+    for module_id, topic in remediation_modules(items).items():
+        if topic not in needed:
+            continue
+        module_name = names.get(module_id, f"{REMEDIATION_PREFIX}{topic}")
+        basis = next(
+            (
+                f"missing:{a.title}"
+                for a in assignments
+                if a.status == "missing"
+                and topic in topics_by_assignment.get(a.assignment_id, [])
+            ),
+            "weakest_topic",
+        )
+        proposals.append(
+            _propose(
+                rule,
+                student,
+                subject=f"module:{module_id}",
+                text=f"Assign '{module_name}' to {student.name}",
+                reason={
+                    "module_id": module_id,
+                    "module_name": module_name,
+                    "topic": topic,
+                    "basis": basis,
+                },
+            )
+        )
+    return proposals
 
 
 RULES: list[Rule] = [
@@ -224,19 +316,19 @@ RULES: list[Rule] = [
     Rule("A4", "A", "advisor", 1, _a4_fourteen_days_quiet),
     Rule("A5", "A", "block", 3, _a5_quiz_in_progress),
     Rule("B3", "B", "block", 3, _b3_targeted_practice),
+    Rule("R1", "R", "module", 2, _r1_remediation_module),
 ]
 
 
 def run_rules(
     students: list[StudentStatus],
     assignments_by_user: dict[int, list[AssignmentStatus]],
+    items: list[ContentItem],
     as_of: date,
 ) -> list[Proposal]:
     proposals = []
     for student in students:
         assignments = assignments_by_user.get(student.user_id, [])
         for rule in RULES:
-            proposal = rule.evaluate(rule, student, assignments, as_of)
-            if proposal is not None:
-                proposals.append(proposal)
+            proposals.extend(rule.evaluate(rule, student, assignments, items, as_of))
     return proposals

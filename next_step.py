@@ -10,6 +10,12 @@
 | B3 | the first practice item whose topics meet the student's weakest topic, else the first practice item |
 
 A rule whose lookup finds nothing leaves both fields None.
+
+This module also owns the two topic questions the rules and the path builder ask of the
+catalogue. `topic_need` names the topics a student is behind on. `remediation_modules` reads
+the catalogue's naming convention: a module called "Remediation: <topic>" is the remedial
+module for that topic, and the text after the prefix is the topic exactly as it appears in a
+content item's `topics` column.
 """
 
 from collections.abc import Callable
@@ -20,6 +26,8 @@ from model import AssignmentStatus, ContentItem, Proposal, StudentStatus
 CANVAS_URL = "http://localhost:3100"
 
 INCOMPLETE_STATUSES = {"missing", "due_soon", "unsubmitted"}
+
+REMEDIATION_PREFIX = "Remediation: "
 
 Resolve = Callable[
     [Proposal, StudentStatus, list[AssignmentStatus], list[ContentItem], int], Proposal
@@ -40,7 +48,7 @@ def _assignment_item(items: list[ContentItem], assignment_id: int) -> ContentIte
     )
 
 
-def _weakest_topics(
+def weakest_topics(
     assignments: list[AssignmentStatus], items: list[ContentItem]
 ) -> list[str] | None:
     scored = [a for a in assignments if a.score is not None and (a.points_possible or 0) > 0]
@@ -49,6 +57,26 @@ def _weakest_topics(
     weakest = min(scored, key=lambda a: a.score / a.points_possible)
     item = _assignment_item(items, weakest.assignment_id)
     return item.topic_list if item is not None else []
+
+
+def topic_need(assignments: list[AssignmentStatus], items: list[ContentItem]) -> list[str]:
+    topics: list[str] = []
+    for assignment in assignments:
+        if assignment.status != "missing":
+            continue
+        item = _assignment_item(items, assignment.assignment_id)
+        if item is not None:
+            topics.extend(item.topic_list)
+    topics.extend(weakest_topics(assignments, items) or [])
+    return list(dict.fromkeys(topics))
+
+
+def remediation_modules(items: list[ContentItem]) -> dict[int, str]:
+    return {
+        i.module_id: i.module_name.removeprefix(REMEDIATION_PREFIX)
+        for i in items
+        if i.module_name.startswith(REMEDIATION_PREFIX)
+    }
 
 
 def _first_named_assignment(
@@ -104,7 +132,7 @@ def _weakest_practice(
     practice = [i for i in items if i.is_practice]
     if not practice:
         return proposal
-    weakest = _weakest_topics(assignments, items)
+    weakest = weakest_topics(assignments, items)
     if weakest is None:
         return _with_basis(_link(proposal, practice[0]), "first_practice")
     for item in practice:

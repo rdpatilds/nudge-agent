@@ -9,6 +9,7 @@ import boto3
 from model import (
     AssignmentStatus,
     ContentItem,
+    PathStep,
     Proposal,
     Recommendation,
     Status,
@@ -57,11 +58,7 @@ def _cell(cell: dict) -> Any:
     return None
 
 
-def _execute(sql: str, parameters: list[dict] | None = None) -> dict:
-    kwargs: dict[str, Any] = {"WorkgroupName": WORKGROUP, "Database": DATABASE, "Sql": sql}
-    if parameters:
-        kwargs["Parameters"] = [{"name": p["name"], "value": str(p["value"])} for p in parameters]
-    statement_id = _client().execute_statement(**kwargs)["Id"]
+def _wait(statement_id: str) -> dict:
     while True:
         described = _client().describe_statement(Id=statement_id)
         state = described["Status"]
@@ -70,6 +67,20 @@ def _execute(sql: str, parameters: list[dict] | None = None) -> dict:
         if state in ("FAILED", "ABORTED"):
             raise RuntimeError(f"Redshift statement {state}: {described.get('Error', '')}")
         time.sleep(1)
+
+
+def _execute(sql: str, parameters: list[dict] | None = None) -> dict:
+    kwargs: dict[str, Any] = {"WorkgroupName": WORKGROUP, "Database": DATABASE, "Sql": sql}
+    if parameters:
+        kwargs["Parameters"] = [{"name": p["name"], "value": str(p["value"])} for p in parameters]
+    return _wait(_client().execute_statement(**kwargs)["Id"])
+
+
+def _execute_batch(sqls: list[str]) -> dict:
+    started = _client().batch_execute_statement(
+        WorkgroupName=WORKGROUP, Database=DATABASE, Sqls=sqls
+    )
+    return _wait(started["Id"])
 
 
 def run(sql: str, parameters: list[dict] | None = None) -> list[dict]:
@@ -203,3 +214,38 @@ def set_status(
         return updated > 0
     check = run(f"SELECT status FROM {SCHEMA}.recommendations WHERE id = {quote(id)}")
     return bool(check) and check[0]["status"] == str(new_status)
+
+
+def _path_row(course_id: int, user_id: int, step: PathStep) -> str:
+    values = [quote(course_id), quote(user_id)] + [
+        quote(getattr(step, f.name)) for f in fields(PathStep)
+    ]
+    return "(" + ", ".join(values) + ")"
+
+
+def replace_paths(course_id: int, steps_by_user: dict[int, list[PathStep]]) -> int:
+    rows = [
+        _path_row(course_id, user_id, step)
+        for user_id, steps in steps_by_user.items()
+        for step in steps
+    ]
+    sqls = [f"DELETE FROM {SCHEMA}.learning_paths WHERE course_id = {quote(course_id)}"]
+    if rows:
+        sqls.append(
+            f"INSERT INTO {SCHEMA}.learning_paths "
+            f"(course_id, user_id, {_columns(PathStep)}) VALUES "
+            + ", ".join(rows)
+        )
+    _execute_batch(sqls)
+    return len(rows)
+
+
+def load_paths(course_id: int) -> dict[int, list[PathStep]]:
+    sql = (
+        f"SELECT user_id, {_columns(PathStep)} FROM {SCHEMA}.learning_paths"
+        " WHERE course_id = :course_id ORDER BY user_id, position"
+    )
+    by_user: dict[int, list[PathStep]] = {}
+    for row in run(sql, [{"name": "course_id", "value": course_id}]):
+        by_user.setdefault(row["user_id"], []).append(from_row(PathStep, row))
+    return by_user

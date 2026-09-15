@@ -87,6 +87,19 @@ class ContentItem:
 
 
 @dataclass(frozen=True)
+class PathStep:
+    position: int
+    module_item_id: int | None
+    title: str
+    url: str
+    reason: str
+    source_rule: str | None
+
+
+Gates = dict[int, set[int]]
+
+
+@dataclass(frozen=True)
 class Proposal:
     rule: str
     user_id: int

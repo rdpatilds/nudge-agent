@@ -1,11 +1,14 @@
 import argparse
 import asyncio
+import json
 import sys
 from collections import Counter
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import canvas_api
 import next_step
+import path
 import redshift
 from canvas_mcp import NudgeSession
 from model import Proposal, Recommendation, Status
@@ -14,17 +17,18 @@ from rules import RULES, run_rules
 TZ = "America/New_York"
 DEFAULT_COURSE = 1
 PUSH_CONTEXT = "SAT-101"
+ASSIGNED_PREFIXES = ("Assigned", "Already assigned")
 
 
 def today() -> date:
     return datetime.now(ZoneInfo(TZ)).date()
 
 
-def scan(course_id: int, as_of: date) -> tuple[list[Proposal], int]:
+def scan(course_id: int, as_of: date) -> tuple[list[Proposal], int, int]:
     students = redshift.load_students(course_id)
     assignments = redshift.load_assignments(course_id)
-    proposals = run_rules(students, assignments, as_of)
     items = redshift.load_content_items(course_id)
+    proposals = run_rules(students, assignments, items, as_of)
     by_user = {s.user_id: s for s in students}
     proposals = [
         next_step.resolve(p, by_user[p.user_id], assignments.get(p.user_id, []), items, course_id)
@@ -33,7 +37,21 @@ def scan(course_id: int, as_of: date) -> tuple[list[Proposal], int]:
     seen = redshift.existing_dedupe_keys([p.dedupe_key(as_of) for p in proposals])
     fresh = [p for p in proposals if p.dedupe_key(as_of) not in seen]
     redshift.insert_proposals(fresh, as_of, PUSH_CONTEXT)
-    return fresh, len(proposals) - len(fresh)
+    counts = build_paths(course_id, as_of)
+    return fresh, len(proposals) - len(fresh), sum(counts.values())
+
+
+def build_paths(course_id: int, as_of: date) -> dict[int, int]:
+    students = redshift.load_students(course_id)
+    assignments = redshift.load_assignments(course_id)
+    items = redshift.load_content_items(course_id)
+    gates = canvas_api.module_gates(course_id, sorted({i.module_id for i in items}))
+    steps_by_user = {
+        s.user_id: path.build_path(s, assignments.get(s.user_id, []), items, gates, as_of)
+        for s in students
+    }
+    redshift.replace_paths(course_id, steps_by_user)
+    return {user_id: len(steps) for user_id, steps in steps_by_user.items()}
 
 
 def proposed_rows() -> list[Recommendation]:
@@ -70,8 +88,27 @@ def push_approved() -> dict[str, int]:
     return asyncio.run(_push(pending))
 
 
+async def _push_row(session: NudgeSession, row: Recommendation) -> str:
+    if row.surface == "module":
+        reason = json.loads(row.reason or "{}")
+        text = await session.assign_module(row.course_id, int(reason["module_id"]), [row.user_id])
+        if not text.startswith(ASSIGNED_PREFIXES):
+            raise RuntimeError(text)
+        return "modules_assigned"
+    if row.text in await session.list_text(row.user_id):
+        return "already_present"
+    await session.push(row.user_id, row.text, PUSH_CONTEXT, row.next_url or "")
+    return "pushed"
+
+
 async def _push(pending: list[Recommendation]) -> dict[str, int]:
-    tally = {"pushed": 0, "already_present": 0, "failed": 0, "skipped_advisor": 0}
+    tally = {
+        "pushed": 0,
+        "already_present": 0,
+        "modules_assigned": 0,
+        "failed": 0,
+        "skipped_advisor": 0,
+    }
     rows = []
     for row in pending:
         if row.surface == "advisor":
@@ -84,13 +121,9 @@ async def _push(pending: list[Recommendation]) -> dict[str, int]:
     async with NudgeSession() as session:
         for row in rows:
             try:
-                if row.text in await session.list_text(row.user_id):
-                    redshift.set_status(row.id, Status.pushed)
-                    tally["already_present"] += 1
-                    continue
-                await session.push(row.user_id, row.text, PUSH_CONTEXT, row.next_url or "")
+                outcome = await _push_row(session, row)
                 redshift.set_status(row.id, Status.pushed)
-                tally["pushed"] += 1
+                tally[outcome] += 1
             except Exception as exc:
                 redshift.set_status(row.id, Status.push_failed, push_error=str(exc)[:512])
                 tally["failed"] += 1
@@ -108,7 +141,7 @@ def _table(headers: list[str], rows: list[list[str]]) -> str:
 
 def cmd_scan(args: argparse.Namespace) -> int:
     as_of = date.fromisoformat(args.as_of) if args.as_of else today()
-    fresh, duplicates = scan(args.course, as_of)
+    fresh, duplicates, path_steps = scan(args.course, as_of)
     by_rule: dict[str, list[int]] = {rule.id: [] for rule in RULES}
     for p in fresh:
         by_rule.setdefault(p.rule, []).append(p.user_id)
@@ -116,6 +149,21 @@ def cmd_scan(args: argparse.Namespace) -> int:
     for rule_id, user_ids in by_rule.items():
         print(f"{rule_id}: {len(user_ids)}  users {sorted(user_ids)}")
     print(f"inserted {len(fresh)}, skipped as duplicate {duplicates}")
+    print(f"path steps {path_steps}")
+    return 0
+
+
+def cmd_path(args: argparse.Namespace) -> int:
+    as_of = date.fromisoformat(args.as_of) if args.as_of else today()
+    counts = build_paths(args.course, as_of)
+    names = {s.user_id: s.name for s in redshift.load_students(args.course)}
+    print(
+        _table(
+            ["user_id", "name", "steps"],
+            [[str(u), names.get(u, ""), str(n)] for u, n in sorted(counts.items())],
+        )
+    )
+    print(f"total steps {sum(counts.values())}")
     return 0
 
 
@@ -152,6 +200,7 @@ def cmd_push(args: argparse.Namespace) -> int:
     tally = push_approved()
     print(
         f"pushed {tally['pushed']}, already present {tally['already_present']}, "
+        f"modules assigned {tally['modules_assigned']}, "
         f"failed {tally['failed']}, skipped advisor {tally['skipped_advisor']}"
     )
     return 0
@@ -172,6 +221,11 @@ def build_parser() -> argparse.ArgumentParser:
     scan_parser.add_argument("--course", type=int, default=DEFAULT_COURSE)
     scan_parser.add_argument("--as-of", dest="as_of", metavar="YYYY-MM-DD")
     scan_parser.set_defaults(func=cmd_scan)
+
+    path_parser = sub.add_parser("path", help="rebuild every student's learning path")
+    path_parser.add_argument("--course", type=int, default=DEFAULT_COURSE)
+    path_parser.add_argument("--as-of", dest="as_of", metavar="YYYY-MM-DD")
+    path_parser.set_defaults(func=cmd_path)
 
     queue_parser = sub.add_parser("queue", help="show the proposed recommendations")
     queue_parser.set_defaults(func=cmd_queue)
