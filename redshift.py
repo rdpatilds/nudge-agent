@@ -6,7 +6,16 @@ from typing import Any
 
 import boto3
 
-from model import AssignmentStatus, Proposal, Recommendation, Status, StudentStatus, from_row, predecessors
+from model import (
+    AssignmentStatus,
+    ContentItem,
+    Proposal,
+    Recommendation,
+    Status,
+    StudentStatus,
+    from_row,
+    predecessors,
+)
 
 WORKGROUP = "canvas"
 DATABASE = "dev"
@@ -97,6 +106,15 @@ def load_assignments(course_id: int) -> dict[int, list[AssignmentStatus]]:
     return by_user
 
 
+def load_content_items(course_id: int) -> list[ContentItem]:
+    sql = (
+        f"SELECT {_columns(ContentItem)} FROM {SCHEMA}.content_items WHERE course_id = :course_id"
+        " ORDER BY module_position, item_position"
+    )
+    rows = run(sql, [{"name": "course_id", "value": course_id}])
+    return [from_row(ContentItem, row) for row in rows]
+
+
 def existing_dedupe_keys(keys: list[str]) -> set[str]:
     if not keys:
         return set()
@@ -123,6 +141,8 @@ def insert_proposals(proposals: list[Proposal], as_of: date, context: str = "SAT
                     quote(p.text),
                     quote(context),
                     reason,
+                    quote(p.next_url),
+                    quote(p.next_title),
                     quote(p.dedupe_key(as_of)),
                 ]
             )
@@ -130,7 +150,8 @@ def insert_proposals(proposals: list[Proposal], as_of: date, context: str = "SAT
         )
     sql = (
         f"INSERT INTO {SCHEMA}.recommendations "
-        "(rule, course_id, user_id, surface, priority, text, context, reason, dedupe_key) VALUES "
+        "(rule, course_id, user_id, surface, priority, text, context, reason, "
+        "next_url, next_title, dedupe_key) VALUES "
         + ", ".join(rows)
     )
     _execute(sql)

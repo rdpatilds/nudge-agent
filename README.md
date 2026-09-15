@@ -1,7 +1,8 @@
 # nudge-agent
 
-Reads student status from Redshift, proposes nudges with the rules in `rules.py`, waits for a
-human decision, and pushes the approved ones into Canvas through the Canvas MCP server.
+Reads student status from Redshift, proposes nudges with the rules in `rules.py`, attaches a next
+step to each with the resolvers in `next_step.py`, waits for a human decision, and pushes the
+approved ones into Canvas through the Canvas MCP server.
 
 ## Commands
 
@@ -15,9 +16,10 @@ uv run nudge_agent.py push
 uv run nudge_agent.py status
 ```
 
-`scan` runs the rules and inserts the new proposals. `queue` lists what is waiting for a
-decision. `push` sends every approved row to Canvas. `as_of` defaults to today in
-America/New_York.
+`scan` runs the rules, resolves the next step for each proposal, and inserts the new
+proposals. `queue` lists what is waiting for a decision. Its `next` column is the title of the
+linked item. `push` sends every approved row to Canvas, text and link together. `as_of`
+defaults to today in America/New_York.
 
 Windows ships no time zone database, which is why `tzdata` is a dependency. Nothing else in
 the tool reads the clock.
@@ -29,9 +31,9 @@ uv run approve_web.py
 ```
 
 Open http://127.0.0.1:8765. The page lists the proposed rows with per-row Approve and Reject
-buttons, an Approve all button, a Push approved button, and the history of decided rows. Use
-`--port` to bind somewhere else. The page calls the same functions as the CLI and records
-`web` as the decider.
+buttons, an Approve all button, a Push approved button, and the history of decided rows. The
+next step shows as a link in both tables. Use `--port` to bind somewhere else. The page calls
+the same functions as the CLI and records `web` as the decider.
 
 ## Schedule
 
@@ -87,7 +89,8 @@ with `os error 32` whenever a Claude Code session or the agent has that server r
    uv run pytest -q
    ```
 
-   Expect `3 passed`.
+   Expect `12 passed`. The test reads the seed CSVs from the sibling `redshift`
+   repository and the module items from `tests\fixtures\content_items.csv`.
 
 4. Optional. Reset the queue to start clean.
 

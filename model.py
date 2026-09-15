@@ -65,6 +65,28 @@ class AssignmentStatus:
 
 
 @dataclass(frozen=True)
+class ContentItem:
+    course_id: int
+    module_id: int
+    module_position: int
+    module_name: str
+    module_item_id: int
+    item_position: int
+    item_type: str
+    content_id: int | None
+    title: str
+    url: str
+    topics: str | None
+    difficulty: str
+    is_practice: bool
+    computed_at: datetime | None
+
+    @property
+    def topic_list(self) -> list[str]:
+        return [t.strip() for t in (self.topics or "").split(",") if t.strip()]
+
+
+@dataclass(frozen=True)
 class Proposal:
     rule: str
     user_id: int
@@ -74,6 +96,8 @@ class Proposal:
     subject: str
     text: str
     reason: dict[str, Any] = field(default_factory=dict)
+    next_url: str | None = None
+    next_title: str | None = None
 
     def dedupe_key(self, as_of: date) -> str:
         return f"{self.rule}|{self.course_id}|{self.user_id}|{self.subject}|{as_of.isoformat()}"
@@ -90,6 +114,8 @@ class Recommendation:
     text: str
     context: str | None
     reason: str | None
+    next_url: str | None
+    next_title: str | None
     dedupe_key: str
     status: str
     decided_by: str | None
@@ -107,6 +133,8 @@ def _coerce(kind: Any, value: Any) -> Any:
         kind = next(arg for arg in get_args(kind) if arg is not NoneType)
     if kind is datetime:
         return value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    if kind is bool:
+        return value if isinstance(value, bool) else str(value).strip().lower() == "true"
     return kind(value)
 
 

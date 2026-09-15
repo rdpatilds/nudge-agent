@@ -5,6 +5,7 @@ from collections import Counter
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
+import next_step
 import redshift
 from canvas_mcp import NudgeSession
 from model import Proposal, Recommendation, Status
@@ -23,6 +24,12 @@ def scan(course_id: int, as_of: date) -> tuple[list[Proposal], int]:
     students = redshift.load_students(course_id)
     assignments = redshift.load_assignments(course_id)
     proposals = run_rules(students, assignments, as_of)
+    items = redshift.load_content_items(course_id)
+    by_user = {s.user_id: s for s in students}
+    proposals = [
+        next_step.resolve(p, by_user[p.user_id], assignments.get(p.user_id, []), items, course_id)
+        for p in proposals
+    ]
     seen = redshift.existing_dedupe_keys([p.dedupe_key(as_of) for p in proposals])
     fresh = [p for p in proposals if p.dedupe_key(as_of) not in seen]
     redshift.insert_proposals(fresh, as_of, PUSH_CONTEXT)
@@ -81,7 +88,7 @@ async def _push(pending: list[Recommendation]) -> dict[str, int]:
                     redshift.set_status(row.id, Status.pushed)
                     tally["already_present"] += 1
                     continue
-                await session.push(row.user_id, row.text, PUSH_CONTEXT)
+                await session.push(row.user_id, row.text, PUSH_CONTEXT, row.next_url or "")
                 redshift.set_status(row.id, Status.pushed)
                 tally["pushed"] += 1
             except Exception as exc:
@@ -119,8 +126,11 @@ def cmd_queue(args: argparse.Namespace) -> int:
         return 0
     print(
         _table(
-            ["id", "rule", "user_id", "surface", "text"],
-            [[str(r.id), r.rule, str(r.user_id), r.surface, r.text] for r in rows],
+            ["id", "rule", "user_id", "surface", "text", "next"],
+            [
+                [str(r.id), r.rule, str(r.user_id), r.surface, r.text, r.next_title or ""]
+                for r in rows
+            ],
         )
     )
     return 0

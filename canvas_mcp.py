@@ -4,9 +4,11 @@ from contextlib import AsyncExitStack
 from mcp import ClientSession, types
 from mcp.client.stdio import StdioServerParameters, stdio_client
 
+from next_step import CANVAS_URL
+
 SERVER_COMMAND = r"D:\Canvas\test\canvas\cmcp\.venv\Scripts\canvas-mcp-server.exe"
 SERVER_ENV = {
-    "CANVAS_API_URL": "http://localhost:3100/api/v1",
+    "CANVAS_API_URL": f"{CANVAS_URL}/api/v1",
     "CANVAS_API_TOKEN": "cplatform-dev-token",
     "CANVAS_ALLOW_INSECURE_HTTP": "true",
     "ENABLE_DATA_ANONYMIZATION": "true",
@@ -48,10 +50,11 @@ class NudgeSession:
         result = await self._session.call_tool("list_nudges", {"user_id": str(user_id)})
         return _result_text(result)
 
-    async def push(self, user_id, text, context) -> str:
-        result = await self._session.call_tool(
-            "push_nudge", {"user_id": str(user_id), "text": text, "context": context}
-        )
+    async def push(self, user_id, text, context, url="") -> str:
+        arguments = {"user_id": str(user_id), "text": text, "context": context}
+        if url:
+            arguments["url"] = url
+        result = await self._session.call_tool("push_nudge", arguments)
         text_out = _result_text(result)
         if result.is_error:
             raise RuntimeError(text_out)

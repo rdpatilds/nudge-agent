@@ -24,6 +24,12 @@ def _e(value) -> str:
     return html.escape("" if value is None else str(value))
 
 
+def _next_cell(url: str | None, title: str | None) -> str:
+    if url is None:
+        return _e(title)
+    return f'<a href="{_e(url)}" target="_top">{_e(title)}</a>'
+
+
 def _proposed_table() -> str:
     rows = proposed_rows()
     if not rows:
@@ -34,6 +40,7 @@ def _proposed_table() -> str:
             "<tr>"
             f"<td>{_e(r.id)}</td><td>{_e(r.rule)}</td><td>{_e(r.user_id)}</td>"
             f"<td>{_e(r.surface)}</td><td>{_e(r.priority)}</td><td>{_e(r.text)}</td>"
+            f"<td>{_next_cell(r.next_url, r.next_title)}</td>"
             f'<td><form method="post" action="/approve/{_e(r.id)}">'
             "<button type=\"submit\">Approve</button></form></td>"
             f'<td><form method="post" action="/reject/{_e(r.id)}">'
@@ -43,7 +50,7 @@ def _proposed_table() -> str:
         )
     header = (
         "<tr><th>id</th><th>rule</th><th>user</th><th>surface</th><th>priority</th>"
-        "<th>text</th><th></th><th></th></tr>"
+        "<th>text</th><th>next</th><th></th><th></th></tr>"
     )
     return "<table>" + header + "".join(body) + "</table>"
 
@@ -57,12 +64,13 @@ def _history_table() -> str:
         body.append(
             "<tr>"
             f"<td>{_e(r.id)}</td><td>{_e(r.rule)}</td><td>{_e(r.user_id)}</td>"
+            f"<td>{_next_cell(r.next_url, r.next_title)}</td>"
             f"<td>{_e(r.status)}</td><td>{_e(r.decided_by)}</td><td>{_e(r.decided_at)}</td>"
             f"<td>{_e(r.decision_note)}</td><td>{_e(r.pushed_at)}</td><td>{_e(r.push_error)}</td>"
             "</tr>"
         )
     header = (
-        "<tr><th>id</th><th>rule</th><th>user</th><th>status</th><th>decided_by</th>"
+        "<tr><th>id</th><th>rule</th><th>user</th><th>next</th><th>status</th><th>decided_by</th>"
         "<th>decided_at</th><th>note</th><th>pushed_at</th><th>push_error</th></tr>"
     )
     return "<table>" + header + "".join(body) + "</table>"
